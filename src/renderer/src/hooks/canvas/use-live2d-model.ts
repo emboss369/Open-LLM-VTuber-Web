@@ -406,6 +406,57 @@ export const useLive2DModel = ({
     }
   }, [isPet, electronApi]);
 
+  // --- Pet Hover Logic (Linux cursor probe) ---
+  // On Linux the pet window is click-through and setIgnoreMouseEvents cannot
+  // forward mouse moves (electron/electron#16777), so handleMouseMove above
+  // never runs. The main process reads the cursor from the X server instead
+  // and sends the viewport-relative point here; hit-test it and report hover
+  // exactly as handleMouseMove would.
+  useEffect(() => {
+    if (!isPet || !electronApi?.ipcRenderer) return undefined;
+
+    const handleProbe = (_event, point) => {
+      // While dragging, the window is already interactive and real mouse
+      // events are flowing. Don't let the probe cancel the drag.
+      if (isDragging) return;
+
+      let hovering = false;
+      const wrapper = document.getElementById('live2d-internal-wrapper');
+      const element = document.elementFromPoint(point.x, point.y);
+
+      if (element && wrapper && !wrapper.contains(element)) {
+        // Pet-mode UI (input box / subtitle) stacks above the canvas.
+        hovering = element !== document.documentElement && element !== document.body;
+      } else {
+        const canvas = canvasRef.current;
+        const adapter = (window as any).getLAppAdapter?.();
+        const model = adapter?.getModel();
+        const view = LAppDelegate.getInstance()?.getView();
+
+        if (canvas && model && view) {
+          const rect = canvas.getBoundingClientRect();
+          const scale = canvas.width / canvas.clientWidth;
+          const modelX = view._deviceToScreen.transformX((point.x - rect.left) * scale);
+          const modelY = view._deviceToScreen.transformY((point.y - rect.top) * scale);
+          hovering = model.anyhitTest(modelX, modelY) !== null
+            || model.isHitOnModel(modelX, modelY);
+        }
+      }
+
+      if (hovering !== isHoveringModelRef.current) {
+        isHoveringModelRef.current = hovering;
+        electronApi.ipcRenderer.send('update-component-hover', 'live2d-model', hovering);
+      }
+    };
+
+    electronApi.ipcRenderer.on('pet-cursor-probe', handleProbe);
+    // removeAllListeners, not removeListener: the callback is proxied across
+    // the context bridge, so the identity check in removeListener can miss.
+    // This channel has no other subscriber.
+    return () => electronApi.ipcRenderer.removeAllListeners('pet-cursor-probe');
+  }, [isPet, electronApi, canvasRef, isDragging]);
+  // --- End Pet Hover Logic (Linux cursor probe) ---
+
   // Expose motion debugging functions to window for console testing
   useEffect(() => {
     const playMotion = (motionGroup: string, motionIndex: number = 0, priority: number = 3) => {

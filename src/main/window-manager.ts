@@ -2,9 +2,60 @@ import {
   BrowserWindow, screen, shell, ipcMain,
 } from 'electron';
 import { join } from 'path';
+import { spawn, ChildProcessWithoutNullStreams } from 'child_process';
 import { is } from '@electron-toolkit/utils';
 
 const isMac = process.platform === 'darwin';
+const isLinux = process.platform === 'linux';
+
+// Linux ignores the `forward` option of setIgnoreMouseEvents
+// (electron/electron#16777, open since 2019), so mouse-move events never reach
+// the renderer while the pet window is click-through. Without them the hover
+// hit-test never fires and the window stays click-through forever.
+// Work around it by polling the cursor from the main process, which can read
+// the pointer regardless of the window's mouse-ignore state, and letting the
+// renderer hit-test that point instead.
+const CURSOR_PROBE_INTERVAL_MS = 50;
+
+// Streams "<x> <y>" lines to stdout whenever the pointer moves, read straight
+// from the X server so the click-through state of our window is irrelevant.
+// Kept inline rather than shipped as a file so it survives asar packaging.
+const X11_POINTER_SCRIPT = `
+import ctypes, sys, time
+X = ctypes.CDLL('libX11.so.6')
+X.XOpenDisplay.restype = ctypes.c_void_p
+display = X.XOpenDisplay(None)
+if not display:
+    sys.exit(1)
+X.XDefaultRootWindow.restype = ctypes.c_ulong
+X.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+root = X.XDefaultRootWindow(display)
+root_ret = ctypes.c_ulong(); child_ret = ctypes.c_ulong()
+rx = ctypes.c_int(); ry = ctypes.c_int()
+wx = ctypes.c_int(); wy = ctypes.c_int()
+mask = ctypes.c_uint()
+X.XQueryPointer.argtypes = [
+    ctypes.c_void_p, ctypes.c_ulong,
+    ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_ulong),
+    ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int),
+    ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int),
+    ctypes.POINTER(ctypes.c_uint)]
+last = None
+while True:
+    X.XQueryPointer(display, root, root_ret, child_ret, rx, ry, wx, wy, mask)
+    point = (rx.value, ry.value)
+    if point != last:
+        last = point
+        sys.stdout.write('%d %d\\n' % point)
+        sys.stdout.flush()
+    time.sleep(0.03)
+`;
+
+// Set PET_DEBUG=1 to trace the pet-mode hover pipeline on stdout.
+const PET_DEBUG = process.env.PET_DEBUG === '1';
+const petLog = (...args: unknown[]): void => {
+  if (PET_DEBUG) console.log('[pet]', ...args);
+};
 
 export class WindowManager {
   private window: BrowserWindow | null = null;
@@ -22,6 +73,11 @@ export class WindowManager {
 
   // Track if mouse events are forcibly ignored
   private forceIgnoreMouse = false;
+
+  // Linux-only: cursor tracking while in pet mode
+  private cursorProbeTimer: NodeJS.Timeout | null = null;
+
+  private pointerProc: ChildProcessWithoutNullStreams | null = null;
 
   constructor() {
     ipcMain.on('renderer-ready-for-mode-change', (_event, newMode) => {
@@ -152,6 +208,9 @@ export class WindowManager {
   private setWindowModeWindow(): void {
     if (!this.window) return;
 
+    this.stopCursorProbe();
+    this.hoveringComponents.clear();
+
     this.window.setAlwaysOnTop(false);
     this.window.setIgnoreMouseEvents(false);
     this.window.setSkipTaskbar(false);
@@ -237,6 +296,8 @@ export class WindowManager {
       this.window.setIgnoreMouseEvents(true, { forward: true });
     }
 
+    this.startCursorProbe();
+
     this.window.webContents.send('mode-changed', 'pet');
   }
   
@@ -282,6 +343,7 @@ export class WindowManager {
   }
 
   updateComponentHover(componentId: string, isHovering: boolean): void {
+    petLog('updateComponentHover', componentId, isHovering, 'mode =', this.currentMode, 'forceIgnore =', this.forceIgnoreMouse);
     if (this.currentMode === 'window') return;
 
     // If force ignore is enabled, don't change the mouse ignore state
@@ -295,6 +357,7 @@ export class WindowManager {
 
     if (this.window) {
       const shouldIgnore = this.hoveringComponents.size === 0;
+      petLog('-> setIgnoreMouseEvents', shouldIgnore, 'hovering =', [...this.hoveringComponents]);
       if (isMac) {
         this.window.setIgnoreMouseEvents(shouldIgnore);
       } else {
@@ -303,6 +366,98 @@ export class WindowManager {
       if (!shouldIgnore) {
         this.window.setFocusable(true);
       }
+    }
+  }
+
+  // Linux-only: feed the cursor position to the renderer so it can hit-test,
+  // standing in for the mouse-move events that
+  // setIgnoreMouseEvents({ forward: true }) would deliver on Windows and macOS.
+  //
+  // screen.getCursorScreenPoint() cannot be used here: while the pet window is
+  // click-through and unfocused, Chromium receives no pointer input at all and
+  // the value it returns stays frozen at wherever the cursor last was. Ask the
+  // X server directly instead, via a small helper that streams XQueryPointer
+  // results on stdout.
+  private startCursorProbe(): void {
+    if (!isLinux) return;
+    this.stopCursorProbe();
+
+    try {
+      const proc = spawn('python3', ['-c', X11_POINTER_SCRIPT], {
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+
+      let buffer = '';
+      proc.stdout.on('data', (chunk: Buffer) => {
+        buffer += chunk.toString();
+        const lines = buffer.split('\n');
+        buffer = lines.pop() ?? '';
+        // Only the newest sample matters; older ones are already stale.
+        const latest = lines.filter((line) => line.length > 0).pop();
+        if (!latest) return;
+
+        const [x, y] = latest.split(' ').map(Number);
+        if (Number.isFinite(x) && Number.isFinite(y)) this.dispatchCursorPoint(x, y);
+      });
+
+      proc.on('error', (error) => {
+        petLog('X11 pointer helper failed to start, falling back:', error.message);
+        this.pointerProc = null;
+        this.startFallbackCursorProbe();
+      });
+
+      this.pointerProc = proc;
+      petLog('X11 pointer helper started, pid =', proc.pid);
+    } catch (error) {
+      petLog('X11 pointer helper threw, falling back:', error);
+      this.startFallbackCursorProbe();
+    }
+  }
+
+  // Used when the X11 helper is unavailable (no python3, no X server).
+  // Accurate only while the window already receives input, but better than
+  // nothing.
+  private startFallbackCursorProbe(): void {
+    this.cursorProbeTimer = setInterval(() => {
+      if (!this.window || this.window.isDestroyed()) {
+        this.stopCursorProbe();
+        return;
+      }
+      const point = screen.getCursorScreenPoint();
+      this.dispatchCursorPoint(point.x, point.y);
+    }, CURSOR_PROBE_INTERVAL_MS);
+  }
+
+  // Convert a screen-space cursor position into renderer viewport coordinates.
+  private dispatchCursorPoint(screenX: number, screenY: number): void {
+    if (!this.window || this.window.isDestroyed()) return;
+    // Nothing to probe when the window is interactive anyway, or when the user
+    // has explicitly forced click-through from the tray menu.
+    if (this.currentMode !== 'pet' || this.forceIgnoreMouse) return;
+
+    // X11 reports physical pixels; Electron bounds and CSS pixels are DIPs.
+    const { scaleFactor } = screen.getPrimaryDisplay();
+    const x = screenX / scaleFactor;
+    const y = screenY / scaleFactor;
+
+    // Content bounds, not window bounds: the window manager may place the frame
+    // elsewhere than requested (GNOME pushes it below the top bar), and the
+    // renderer's viewport origin follows the content area.
+    const bounds = this.window.getContentBounds();
+    this.window.webContents.send('pet-cursor-probe', {
+      x: x - bounds.x,
+      y: y - bounds.y,
+    });
+  }
+
+  private stopCursorProbe(): void {
+    if (this.cursorProbeTimer) {
+      clearInterval(this.cursorProbeTimer);
+      this.cursorProbeTimer = null;
+    }
+    if (this.pointerProc) {
+      this.pointerProc.kill();
+      this.pointerProc = null;
     }
   }
 
